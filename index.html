@@ -161,7 +161,7 @@ async function loadRemoteState(){
   client.from('transactions').select('user_id,id,transaction_date,account_name,client,kind,amount,notes,created')
  ]);
  if(pe) throw pe; if(ae) throw ae; if(te) throw te;
- activeUser=(await client.auth.getUser()).data.user.email||''; activeUserRole=profile?.role==='admin'?'admin':'operator';
+ activeUser=(await client.auth.getUser()).data.user.email||''; activeUserRole=String(profile?.role||'').trim().toLowerCase()==='admin'?'admin':'operator';
  const hasRemote=(accounts||[]).length||(transactions||[]).length;
  if(hasRemote){
   state.openings={}; for(const a of accounts||[]) state.openings[a.account_name]=Number(a.opening_balance||0);
@@ -172,20 +172,20 @@ async function loadRemoteState(){
   let local={openings:{},tx:[],audit:[]};
   try{const cfg=JSON.parse(localStorage.getItem(AUTH_KEY)||'null');const vault=JSON.parse(localStorage.getItem(VAULT_KEY)||'null');if(cfg&&vault){const u=cfg.users?.[0];if(u){const pass=prompt('لترحيل بيانات هذا الجهاز لأول مرة، أدخل كلمة مرور المدير المحلية القديمة. اتركها فارغة إذا لا توجد بيانات محلية.');if(pass){const k=await makeKeys(pass,unb64(u.salt));if(k.verifier!==u.verifier)throw new Error('كلمة المرور المحلية غير صحيحة؛ لم يتم ترحيل البيانات.');const raw=await decryptBytes(u.wrappedKey,k.aes);local=normalizeState(await decryptState(vault,await importDataKey(raw)));}}}}catch(e){if(e.message!=='cancel')throw e;}
   state=local;
-  await pushRemoteState();
+  await pushRemoteState(true);
  }
  remoteReady=true;
 }
-async function pushRemoteState(){
+async function pushRemoteState(includeTransactions=false){
  const client=getSupabase(); const user=(await client.auth.getUser()).data.user; if(!user)throw new Error('انتهت جلسة الدخول.');
  // Opening balances are administrator-managed; operators cannot write account records.
  if(isAdmin()){
   const accountRows=ACCOUNTS.map(account_name=>({user_id:user.id,account_name,opening_balance:Number(state.openings[account_name]||0)}));
   const {error:ae}=await client.from('accounts').upsert(accountRows,{onConflict:'user_id,account_name'}); if(ae)throw ae;
  }
- if(state.tx.length){
+ if(includeTransactions && state.tx.length){
+  // Used only for first-time migration or an explicit backup restore, never routine edits.
   const rows=state.tx.map(t=>({user_id:t.user_id||user.id,id:String(t.id),transaction_date:t.date,account_name:t.account,client:t.client,kind:t.kind,amount:Number(t.amount),notes:t.notes||'',created:Number(t.created||Date.now())}));
-  // Operators may only INSERT. ignoreDuplicates prevents an upsert from attempting UPDATE.
   const result=isAdmin()
    ? await client.from('transactions').upsert(rows,{onConflict:'user_id,id'})
    : await client.from('transactions').upsert(rows,{onConflict:'user_id,id',ignoreDuplicates:true});
@@ -234,9 +234,45 @@ function renderTx(){let arr=getFiltered();document.getElementById('txRows').inne
 document.getElementById('clearFilters').onclick=()=>{['filterAccount','filterClient','filterFrom','filterTo'].forEach(id=>document.getElementById(id).value='');renderTx()};
 function resetForm(){document.getElementById('txForm').reset();document.getElementById('editId').value='';document.getElementById('date').value=new Date().toISOString().slice(0,10);document.getElementById('formTitle').textContent='تسجيل حركة جديدة'}
 document.getElementById('resetForm').onclick=resetForm;
-document.getElementById('txForm').onsubmit=e=>{e.preventDefault();let id=document.getElementById('editId').value;if(id&&!isAdmin()){alert('هذا الحساب لا يملك صلاحية تعديل سجل الحركات.');resetForm();return}let tx={id:id||String(Date.now())+Math.random().toString(16).slice(2),user_id:id?(state.tx.find(x=>x.id===id)?.user_id):undefined,date:document.getElementById('date').value,account:document.getElementById('account').value,client:document.getElementById('client').value.trim(),kind:document.getElementById('kind').value,amount:Number(document.getElementById('amount').value),notes:document.getElementById('notes').value.trim(),created:Date.now()};if(!tx.client||!tx.amount||tx.amount<=0)return alert('راجع اسم العميل والمبلغ.');if(id){let i=state.tx.findIndex(x=>x.id===id);if(i>=0)state.tx[i]=tx;addAudit('تعديل حركة',tx.account+' — '+tx.amount)}else{state.tx.push(tx);addAudit('إضافة حركة',tx.account+' — '+tx.amount)}save().then(()=>{resetForm();nav('home');alert('تم حفظ الحركة بنجاح')}).catch(err=>{if(!id)state.tx=state.tx.filter(x=>x.id!==tx.id);else{const prior=state.tx.find(x=>x.id===id);if(prior)Object.assign(prior,tx)}renderAll();alert('تعذر حفظ الحركة على الخادم: '+(err.message||err))})};
+document.getElementById('txForm').onsubmit=async e=>{
+ e.preventDefault();
+ const id=document.getElementById('editId').value;
+ if(id&&!isAdmin()){alert('هذا الحساب لا يملك صلاحية تعديل سجل الحركات.');resetForm();return;}
+ const client=getSupabase();
+ const {data:{user},error:userError}=await client.auth.getUser();
+ if(userError||!user){alert('انتهت جلسة الدخول. سجّل الدخول مرة أخرى.');return;}
+ const existing=id?state.tx.find(x=>String(x.id)===String(id)):null;
+ if(id&&!existing){alert('الحركة غير موجودة في القائمة الحالية. حدّث الصفحة وحاول مرة أخرى.');return;}
+ const tx={id:id||String(Date.now())+Math.random().toString(16).slice(2),user_id:existing?.user_id||user.id,date:document.getElementById('date').value,account:document.getElementById('account').value,client:document.getElementById('client').value.trim(),kind:document.getElementById('kind').value,amount:Number(document.getElementById('amount').value),notes:document.getElementById('notes').value.trim(),created:existing?.created||Date.now()};
+ if(!tx.client||!tx.amount||tx.amount<=0)return alert('راجع اسم العميل والمبلغ.');
+ const payload={transaction_date:tx.date,account_name:tx.account,client:tx.client,kind:tx.kind,amount:tx.amount,notes:tx.notes};
+ try{
+  if(id){
+   // Update exactly one existing row, retaining its original owner and ID.
+   const {data,error}=await client.from('transactions').update(payload).eq('user_id',tx.user_id).eq('id',String(id)).select('id').maybeSingle();
+   if(error)throw error;
+   if(!data)throw new Error('لم يسمح الخادم بتعديل هذه الحركة أو لم يعثر عليها. تحقق من سياسة UPDATE وملكية السجل.');
+   const i=state.tx.findIndex(x=>String(x.id)===String(id));state.tx[i]=tx;
+   addAudit('تعديل حركة',tx.account+' — '+tx.amount);
+  }else{
+   const {error}=await client.from('transactions').insert({...payload,user_id:user.id,id:tx.id,created:tx.created});
+   if(error)throw error;
+   state.tx.push(tx);addAudit('إضافة حركة',tx.account+' — '+tx.amount);
+  }
+  await save();resetForm();renderAll();nav('home');alert('تم حفظ الحركة بنجاح');
+ }catch(err){renderAll();alert('تعذر حفظ الحركة على الخادم: '+(err.message||err));}
+};
 function editTx(id){if(!isAdmin()){alert('هذا الحساب للعرض فقط ولا يستطيع تعديل الحركات.');return;}let t=state.tx.find(x=>x.id===id);if(!t)return;nav('entry');document.getElementById('editId').value=t.id;document.getElementById('date').value=t.date;document.getElementById('account').value=t.account;document.getElementById('client').value=t.client;document.getElementById('kind').value=t.kind;document.getElementById('amount').value=t.amount;document.getElementById('notes').value=t.notes;document.getElementById('formTitle').textContent='تعديل الحركة';}
-function deleteTx(id){if(!isAdmin()){alert('هذا الحساب لا يملك صلاحية حذف الحركات.');return;}if(confirm('هل تريد حذف هذه الحركة؟ لا يمكن التراجع عن الحذف.')){const old=state.tx.find(t=>t.id===id);state.tx=state.tx.filter(t=>t.id!==id);if(sb){sb.from('transactions').delete().eq('user_id',old?.user_id||'').eq('id',String(id)).then(({error})=>{if(error)alert('تعذر حذف الحركة من الخادم: '+error.message)})}addAudit('حذف حركة',old?old.account+' — '+old.amount:'');save()}}
+async function deleteTx(id){
+ if(!isAdmin()){alert('هذا الحساب لا يملك صلاحية حذف الحركات.');return;}
+ if(!confirm('هل تريد حذف هذه الحركة؟ لا يمكن التراجع عن الحذف.'))return;
+ const old=state.tx.find(t=>String(t.id)===String(id));if(!old)return;
+ try{
+  const client=getSupabase();const {error}=await client.from('transactions').delete().eq('user_id',old.user_id||'').eq('id',String(id));
+  if(error)throw error;
+  state.tx=state.tx.filter(t=>String(t.id)!==String(id));addAudit('حذف حركة',old.account+' — '+old.amount);await save();renderAll();
+ }catch(err){alert('تعذر حذف الحركة من الخادم: '+(err.message||err));}
+}
 function renderOpenings(){document.getElementById('openingFields').innerHTML=ACCOUNTS.map((a,i)=>`<div><label>${a}</label><input type="number" min="0" step=".01" id="opening${i}" value="${Number(state.openings[a]||0)}"></div>`).join('')}
 document.getElementById('saveOpenings').onclick=()=>{if(!isAdmin())return alert('هذه الصلاحية للمدير فقط.');ACCOUNTS.forEach((a,i)=>state.openings[a]=Number(document.getElementById('opening'+i).value||0));addAudit('تعديل الأرصدة الافتتاحية','');save();alert('تم حفظ الأرصدة الافتتاحية')};
 function runReport(){let a=document.getElementById('reportAccount').value,c=document.getElementById('reportClient').value.trim().toLowerCase(),f=document.getElementById('reportFrom').value,to=document.getElementById('reportTo').value;let arr=[...state.tx].filter(t=>(!a||t.account===a)&&(!c||t.client.toLowerCase().includes(c))&&(!f||t.date>=f)&&(!to||t.date<=to)).sort((x,y)=>x.date.localeCompare(y.date)||x.created-y.created);document.getElementById('reportRows').innerHTML=arr.length?arr.map(t=>`<tr><td>${esc(t.date)}</td><td>${esc(t.account)}</td><td>${esc(t.client)}</td><td>${label(t.kind,t.account)}</td><td class="num ${t.kind==='in'?'positive':'negative'}">${money(t.amount)}</td><td>${esc(t.notes)}</td></tr>`).join(''):'<tr><td colspan="6" class="empty">لا توجد حركات مطابقة</td></tr>';let ins=arr.filter(t=>t.kind==='in').reduce((s,t)=>s+Number(t.amount),0),outs=arr.filter(t=>t.kind==='out').reduce((s,t)=>s+Number(t.amount),0);document.getElementById('reportSummary').innerHTML=`<span>عدد الحركات: ${arr.length}</span><span class="positive">إجمالي الوارد: ${money(ins)}</span><span class="negative">إجمالي الصادر: ${money(outs)}</span><span>صافي الفترة: ${money(ins-outs)}</span>`}
@@ -246,7 +282,7 @@ document.getElementById('exportCsv').onclick=()=>{if(!isAdmin())return alert('ه
 document.getElementById('backup').onclick=async()=>{if(!isAdmin())return alert('هذه الصلاحية للمدير فقط.');try{addAudit('إنشاء نسخة احتياطية مشفرة','');await save();const vault=JSON.parse(localStorage.getItem(VAULT_KEY));const pack={format:'finance-and-operations-encrypted-backup',version:3,createdAt:new Date().toISOString(),auth:authConfig,vault};download(new Blob([JSON.stringify(pack,null,2)],{type:'application/json'}),'Finance_and_Operations_Encrypted_Backup.json')}catch(err){alert('تعذر إنشاء النسخة الاحتياطية: '+err.message)}};
 function download(blob,name){let u=URL.createObjectURL(blob),a=document.createElement('a');a.href=u;a.download=name;a.click();setTimeout(()=>URL.revokeObjectURL(u),1500)}
 document.getElementById('restoreFile').onchange=async e=>{if(!isAdmin()){alert('هذه الصلاحية للمدير فقط.');e.target.value='';return}let f=e.target.files[0];if(!f)return;try{let d=JSON.parse(await f.text());let imported;if(d?.format==='finance-and-operations-encrypted-backup'&&d.auth&&d.vault){const pass=prompt('أدخل كلمة مرور المستخدم الذي أنشأ النسخة الاحتياطية:');if(pass===null)throw new Error('تم إلغاء الاستعادة');let backupKey;if(d.version===3&&Array.isArray(d.auth.users)){const who=prompt('أدخل اسم المستخدم الموجود في النسخة الاحتياطية:');const u=d.auth.users.find(x=>x.username===who);if(!u)throw new Error('اسم المستخدم غير موجود في النسخة الاحتياطية');const k=await makeKeys(pass,unb64(u.salt));if(k.verifier!==u.verifier)throw new Error('كلمة مرور النسخة الاحتياطية غير صحيحة');backupKey=await importDataKey(await decryptBytes(u.wrappedKey,k.aes))}else if(d.version===2&&d.auth.salt){const k=await makeKeysV2(pass,unb64(d.auth.salt));if(k.verifier!==d.auth.verifier)throw new Error('كلمة مرور النسخة الاحتياطية غير صحيحة');backupKey=k.aes}else throw new Error('صيغة النسخة الاحتياطية غير مدعومة');imported=normalizeState(await decryptState(d.vault,backupKey))}else{if(!d||!Array.isArray(d.tx)||typeof d.openings!=='object')throw new Error('ملف النسخة الاحتياطية غير صالح');if(!confirm('هذه نسخة قديمة غير مشفرة. سيتم تشفيرها فور استيرادها. هل تريد المتابعة؟'))throw new Error('تم إلغاء الاستعادة');imported=normalizeState(d)}
-const merge=confirm('اضغط موافق لدمج الحركات الجديدة دون تكرار، أو إلغاء لاستبدال البيانات الحالية بالكامل.');if(merge){const ids=new Set(state.tx.map(t=>String(t.id)));const fresh=imported.tx.filter(t=>!ids.has(String(t.id)));state.tx.push(...fresh);if(!Object.keys(state.openings).length)state.openings=imported.openings;addAudit('دمج نسخة احتياطية',`تم استيراد ${fresh.length} حركة جديدة`)}else{state=imported;addAudit('استبدال البيانات بنسخة احتياطية','')};await save();renderOpenings();alert('تمت استعادة البيانات وحفظها مشفرة.')}catch(err){if(err.message!=='تم إلغاء الاستعادة'&&err.message!=='تم إلغاء الاستعادة')alert(err.message||'ملف النسخة الاحتياطية غير صالح')}e.target.value=''};
+const merge=confirm('اضغط موافق لدمج الحركات الجديدة دون تكرار، أو إلغاء لاستبدال البيانات الحالية بالكامل.');if(merge){const ids=new Set(state.tx.map(t=>String(t.id)));const fresh=imported.tx.filter(t=>!ids.has(String(t.id)));state.tx.push(...fresh);if(!Object.keys(state.openings).length)state.openings=imported.openings;addAudit('دمج نسخة احتياطية',`تم استيراد ${fresh.length} حركة جديدة`)}else{state=imported;addAudit('استبدال البيانات بنسخة احتياطية','')};await pushRemoteState(true);await save();renderOpenings();alert('تمت استعادة البيانات وحفظها مشفرة.')}catch(err){if(err.message!=='تم إلغاء الاستعادة'&&err.message!=='تم إلغاء الاستعادة')alert(err.message||'ملف النسخة الاحتياطية غير صالح')}e.target.value=''};
 document.getElementById('wipe').onclick=()=>{if(!isAdmin())return alert('هذه الصلاحية للمدير فقط.');if(confirm('سيتم حذف كل الحركات المسجلة نهائيًا من هذا المتصفح. هل أنت متأكد؟')){state.tx=[];addAudit('مسح كل الحركات','');save()}};
 function renderAll(){renderHome();renderTx();renderOpenings();if(isAdmin())renderUsers();const ar=[...(state.audit||[])].reverse().slice(0,200);const el=document.getElementById('auditRows');if(el)el.innerHTML=ar.length?ar.map(x=>`<tr><td>${esc(new Date(x.at).toLocaleString('ar-EG'))}</td><td>${esc(x.user)}</td><td>${esc(x.action)}</td><td>${esc(x.details)}</td></tr>`).join(''):'<tr><td colspan="4" class="empty">لا توجد عمليات مسجلة</td></tr>'}
 resetForm();initializeSecurity();
